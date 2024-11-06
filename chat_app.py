@@ -1,73 +1,182 @@
+import uuid
+
 import os
+import tempfile
 import streamlit as st
 from streamlit_chat import message
+import chromadb
 
 from langchain.chat_models import ChatOpenAI
-from langchain.memory import ConversationBufferMemory
-from langchain.document_loaders import WebBaseLoader
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_community.embeddings.openai import OpenAIEmbeddings
 from langchain.document_loaders import PyPDFLoader
-from langchain.embeddings import OpenAIEmbeddings
+from langchain.text_splitter import CharacterTextSplitter
 from langchain.vectorstores import Chroma
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_core.prompts import ChatPromptTemplate
 from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationChain
-from langchain.chains import ConversationalRetrievalChain
-from langchain.schema import HumanMessage
-from langchain.schema import AIMessage
+from langchain.schema import HumanMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
 
 # 環境変数の読み込み
 from dotenv import load_dotenv
 load_dotenv()
 
-# LLMのインスタンスの作成
-chat = ChatOpenAI(model_name=os.environ["OPENAI_API_MODEL"])
-
-# セッション内に保存されたチャット履歴のメモリの取得
-try:
-    memory = st.session_state["memory"]
-except:
-    memory = ConversationBufferMemory(return_messages=True)
-
-# チャット用のチェーンのインスタンスの作成
-chain = ConversationChain(
-    llm=chat,
-    memory=memory,
-)
+# Chromaのキャッシュをリセット
+chromadb.api.client.SharedSystemClient.clear_system_cache()
 
 # Streamlitによって、タイトル部分のUIをの作成
 st.title("Chatbot in Streamlit")
 
-# 入力フォームと送信ボタンのUIの作成
-text_input = st.text_input("Enter your message")
-send_button = st.button("Send")
+# LLMのインスタンスの作成
+llm = ChatOpenAI(
+        temperature=os.environ["OPENAI_API_TEMPERATURE"],
+        model_name=os.environ["OPENAI_API_MODEL"],
+        api_key=os.environ["OPENAI_API_KEY"],
+        max_retries=5,
+        timeout=60,
+    )
 
-# チャット履歴（HumanMessageやAIMessageなど）を格納する配列の初期化
-history = []
+# プロジェクト内のPDFファイルを読み込み
+file_path = os.environ["DOCUMENT_FILE_PATH"]
+loader = PyPDFLoader(file_path)
+docs = loader.load()
 
-# ボタンが押された時、OpenAIのAPIを実行
-if send_button:
-    send_button = False
+# 設定を定義
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 64
+PERSIST_PATH = "./.chroma_db"
+COLLECTION_NAME = "langchain"
 
-    # ChatGPTの実行
-    chain(text_input)
+text_splitter = CharacterTextSplitter(
+        separator = "\n",
+        chunk_size = CHUNK_SIZE,
+        chunk_overlap  = CHUNK_OVERLAP,
+    )
 
-    # セッションへのチャット履歴の保存
-    st.session_state["memory"] = memory
+# テキストデータを分割
+docs = text_splitter.split_documents(docs)
 
-    # チャット履歴（HumanMessageやAIMessageなど）の読み込み
-    try:
-        history = memory.load_memory_variables({})["history"]
-    except Exception as e:
-        st.error(e)
+# 分割したデータをベクトル化
+vectorstore = Chroma.from_documents(
+    collection_name=COLLECTION_NAME,
+    documents=docs,                             
+    embedding=OpenAIEmbeddings(),
+    persist_directory=PERSIST_PATH
+)
 
-# チャット履歴の表示
-for index, chat_message in enumerate(reversed(history)):
-    if type(chat_message) == HumanMessage:
-        message(chat_message.content, is_user=True, key=2 * index)
-    elif type(chat_message) == AIMessage:
-        message(chat_message.content, is_user=False, key=2 * index + 1)
+# ベクトルストアからレトリーバーを作成
+retriever = vectorstore.as_retriever()
+st.session_state["retriever"] = retriever
+retriever = st.session_state["retriever"]
 
+if "llm" not in st.session_state:
+    st.session_state["llm"] = llm
+llm = st.session_state["llm"]
 
+# セッション内に保存されたチャット履歴のメモリの取得
+if "session_id" not in st.session_state:
+    st.session_state["session_id"] = str(uuid.uuid4())[:8]
+session_id = st.session_state["session_id"]
 
+if "history" not in st.session_state:
+    st.session_state["history"] = ChatMessageHistory()
+history = st.session_state["history"]
+
+# sessionから履歴を取得
+def get_session_history(session_id: str):
+    return history
+
+# RAGを実行し、回答を生成
+def create_chain():
+
+    # 履歴のシステムプロンプト
+    contextualize_q_system_prompt = """Given a chat history and the latest user question \
+        which might reference context in the chat history, formulate a standalone question \
+        which can be understood without the chat history. Do NOT answer the question, \
+        just reformulate it if needed and otherwise return it as is."""
+
+    # Contextualizing用のプロンプトテンプレートの作成
+    contextualize_q_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", contextualize_q_system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+
+    # 履歴レトリーバーの作成
+    history_aware_retriever = create_history_aware_retriever(
+        llm,
+        retriever,
+        contextualize_q_prompt
+    )
+
+    # 回答のシステムプロンプト
+    qa_system_prompt = """You are an assistant for question-answering tasks. \
+        Use the following pieces of retrieved context to answer \
+        the question. If you don't know the answer, say that you \
+        don't know. Use three sentences maximum and keep the \
+        answer concise.
+        {context}"""
+
+    # 実際にRAGを実行するためのQA用プロンプトテンプレートの作成
+    qa_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", qa_system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+
+    # 回答チェーン
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+
+    # 履歴レトリーバーと回答チェーンを順番に適用するチェーンを作成
+    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+
+    conversational_rag_chain = RunnableWithMessageHistory(
+            rag_chain,
+            get_session_history,
+            input_messages_key="input",
+            history_messages_key="chat_history",
+            output_messages_key="answer",
+        )
+
+    return conversational_rag_chain
+
+if "chain" not in st.session_state:
+    # create_chain関数を実行し、回答を生成
+    st.session_state["chain"] = create_chain()
+
+chain = st.session_state["chain"]
+
+for h in history:
+    for message in h[1]:
+        if isinstance(message, AIMessage):
+            with st.chat_message("AI"):
+                st.write(message.content)
+        if isinstance(message, HumanMessage):
+            with st.chat_message("Human"):
+                st.write(message.content)
+
+if prompt := st.chat_input("質問を入力"):
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        stream = chain.stream(
+            {"input": prompt},
+            config={
+                "configurable": {"session_id": session_id},
+            },
+        )
+
+        def s():
+            for chunk in stream:
+                if "answer" in chunk:
+                    yield chunk["answer"]
+
+        st.write_stream(s)
 
